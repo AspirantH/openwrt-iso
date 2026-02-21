@@ -1,14 +1,14 @@
-name: Build-ImmortalWRT-ISO
+name: Build-OpenWRT-ISO
 
 on:
   workflow_dispatch:
     inputs:
       alpine_version:
-        description: 'Alpine 版本'
+        description: 'Alpine 版本（用于构建环境，不影响镜像）'
         required: false
         default: '3.20'
       image_url:
-        description: 'img.gz 文件直链（以.img.gz 结尾）'
+        description: 'OpenWRT img.gz 文件直链（必填，建议以 .img.gz 结尾）'
         required: true
         type: string
 
@@ -32,7 +32,8 @@ jobs:
               ca-certificates \
               curl \
               gnupg \
-              lsb-release
+              lsb-release \
+              file  # 添加 file 命令用于检测文件类型
 
           # 添加Docker官方GPG密钥
           sudo mkdir -p /etc/apt/keyrings
@@ -55,7 +56,6 @@ jobs:
           sudo systemctl start docker
           sudo systemctl enable docker
 
-          # 验证
           docker --version
           echo "✅ Docker安装成功"
 
@@ -66,39 +66,53 @@ jobs:
           chmod 777 output
 
           IMAGE_URL="${{ github.event.inputs.image_url }}"
-          echo "使用手工提供的链接: $IMAGE_URL"
-
-          # 检查链接是否以 .img.gz 结尾
-          if [[ ! "$IMAGE_URL" =~ \.img\.gz$ ]]; then
-              echo "❌ 错误: 提供的链接不是以 .img.gz 结尾"
-              exit 1
-          fi
+          echo "使用提供的链接: $IMAGE_URL"
 
           # 提取文件名（URL最后一部分）
           FILENAME_GZ=$(basename "$IMAGE_URL")
-          # 下载到 assets/ 下，保持原始文件名
+          DOWNLOAD_PATH="assets/$FILENAME_GZ"
+
+          # 下载文件
           echo "下载文件: $FILENAME_GZ"
-          wget -q "$IMAGE_URL" -O "assets/$FILENAME_GZ" || curl -L -o "assets/$FILENAME_GZ" --retry 3 "$IMAGE_URL"
+          wget -q "$IMAGE_URL" -O "$DOWNLOAD_PATH" || curl -L -o "$DOWNLOAD_PATH" --retry 3 "$IMAGE_URL"
           if [ $? -ne 0 ]; then
               echo "❌ 下载失败"
               exit 1
           fi
 
-          # 解压（自动删除 .gz 后缀，得到 .img 文件）
-          echo "解压中..."
-          gzip -d "assets/$FILENAME_GZ"
-          # 解压后的文件路径（去掉 .gz）
-          IMG_PATH="assets/${FILENAME_GZ%.gz}"
+          # 检查文件大小（防止下载错误页面）
+          FILE_SIZE=$(stat -c%s "$DOWNLOAD_PATH")
+          echo "下载文件大小: $FILE_SIZE 字节 ($(numfmt --to=iec $FILE_SIZE))"
+          if [ $FILE_SIZE -lt 1048576 ]; then  # 小于1MB可能有问题
+              echo "⚠️ 警告: 文件小于1MB，可能不是有效的镜像文件"
+          fi
+
+          # 检测文件类型
+          FILE_TYPE=$(file -b "$DOWNLOAD_PATH")
+          echo "文件类型: $FILE_TYPE"
+
+          # 判断是否为 gzip 压缩
+          if file "$DOWNLOAD_PATH" | grep -q "gzip compressed"; then
+              echo "检测到 gzip 压缩格式，正在解压..."
+              gzip -d "$DOWNLOAD_PATH"
+              IMG_PATH="assets/${FILENAME_GZ%.gz}"
+              echo "解压完成: $IMG_PATH"
+          else
+              echo "文件不是 gzip 压缩格式，直接作为镜像使用"
+              IMG_PATH="$DOWNLOAD_PATH"
+          fi
 
           # 检查最终镜像是否存在
           if [ ! -f "$IMG_PATH" ]; then
-              echo "❌ 错误: 解压后的镜像文件 $IMG_PATH 不存在"
+              echo "❌ 错误: 镜像文件 $IMG_PATH 不存在"
               exit 1
           fi
-          echo "镜像路径: $IMG_PATH"
-          echo "镜像大小: $(stat -c%s "$IMG_PATH" | numfmt --to=iec)"
 
-          # 将路径设为步骤输出
+          FINAL_SIZE=$(stat -c%s "$IMG_PATH")
+          echo "最终镜像路径: $IMG_PATH"
+          echo "最终镜像大小: $(numfmt --to=iec $FINAL_SIZE)"
+
+          # 输出路径供后续步骤使用
           echo "IMG_PATH=$IMG_PATH" >> $GITHUB_OUTPUT
 
       - name: Generate timestamp for release
@@ -110,11 +124,18 @@ jobs:
           echo "RELEASE_NAME=手动构建 $TIMESTAMP" >> $GITHUB_OUTPUT
 
       - name: Build ISO
-        uses: sirpdboy/openwrt-installer-iso@main
+        uses: learnscode/openwrt-installer-iso@main
         with:
           INPUT_IMG: "${{ steps.download.outputs.IMG_PATH }}"
           OUTPUT_DIR: "./output"
           OUTPUT_ISO_NAME: "immortalwrt-installer.iso"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-installer
+          path: output/*.iso
+          retention-days: 30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -122,7 +143,6 @@ jobs:
           tag_name: ${{ steps.timestamp.outputs.RELEASE_TAG }}
           name: ${{ steps.timestamp.outputs.RELEASE_NAME }}
           body: |
-            # EzOpWrt 安装器
 
             ## 构建信息
             - 构建时间: ${{ steps.timestamp.outputs.TIMESTAMP }}
@@ -130,6 +150,6 @@ jobs:
             - 镜像来源: ${{ github.event.inputs.image_url }}
             - 提交: ${{ github.sha }}
           files: output/*.iso
-          prerelease: false  # 可以根据需要改为 true
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
