@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       alpine_version:
-        description: 'Alpine 版本（用于构建环境，不影响镜像）'
+        description: 'Alpine 版本'
         required: false
         default: '3.20'
       image_url:
-        description: 'OpenWRT img.gz 文件直链（必填，必须以 .img.gz 结尾）'
+        description: 'OpenWRT img.gz 文件直链（必填，以 .img.gz 结尾）'
         required: true
         type: string
 
@@ -30,7 +30,7 @@ jobs:
               curl \
               gnupg \
               lsb-release \
-              bsdmainutils  # 提供 hexdump
+              bsdmainutils
           sudo mkdir -p /etc/apt/keyrings
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
           echo \
@@ -71,24 +71,29 @@ jobs:
 
           # 输出文件头部信息（前32字节）
           echo "文件头部 (前32字节):"
-          hexdump -C "$DOWNLOAD_PATH" | head -2
+          hexdump -C "$DOWNLOAD_PATH" | head -2 || echo "hexdump failed"
 
-          # 尝试解压
+          # 尝试解压（忽略退出码，因为即使有 trailing garbage 也可能解压成功）
           echo "正在解压 $DOWNLOAD_PATH ..."
-          if gzip -d "$DOWNLOAD_PATH"; then
-              # 解压成功，去掉 .gz 后缀得到 .img 文件路径
-              IMG_PATH="assets/${FILENAME_GZ%.gz}"
+          gzip -d "$DOWNLOAD_PATH" 2>&1 || true
+
+          # 解压后的文件路径（去掉 .gz）
+          IMG_PATH="assets/${FILENAME_GZ%.gz}"
+
+          # 检查解压后的文件是否存在且非空
+          if [ -f "$IMG_PATH" ] && [ -s "$IMG_PATH" ]; then
               echo "解压成功: $IMG_PATH"
           else
-              echo "❌ gzip 解压失败，文件可能不是有效的 gzip 格式或已损坏"
-              echo "请检查上面输出的文件头部信息，确保前两个字节应为 1f 8b (gzip 魔数)"
-              exit 1
-          fi
-
-          # 检查解压后的文件是否存在
-          if [ ! -f "$IMG_PATH" ]; then
-              echo "❌ 错误: 解压后的镜像文件 $IMG_PATH 不存在"
-              exit 1
+              echo "❌ 标准解压失败，尝试使用 gunzip -c 手动解压..."
+              # 使用 gunzip -c 重定向到临时文件
+              gunzip -c "$DOWNLOAD_PATH" > "${IMG_PATH}.tmp" 2>/dev/null
+              if [ $? -eq 0 ] && [ -s "${IMG_PATH}.tmp" ]; then
+                  mv "${IMG_PATH}.tmp" "$IMG_PATH"
+                  echo "手动解压成功: $IMG_PATH"
+              else
+                  echo "❌ 所有解压尝试均失败"
+                  exit 1
+              fi
           fi
 
           # 转换为绝对路径
@@ -96,7 +101,6 @@ jobs:
           echo "最终镜像绝对路径: $ABS_IMG_PATH"
           echo "最终镜像大小: $(stat -c%s "$ABS_IMG_PATH" | numfmt --to=iec)"
 
-          # 输出路径供后续步骤使用
           echo "IMG_PATH=$ABS_IMG_PATH" >> $GITHUB_OUTPUT
 
       - name: Generate timestamp for release
