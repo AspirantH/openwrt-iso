@@ -8,7 +8,7 @@ on:
         required: false
         default: '3.20'
       image_url:
-        description: 'OpenWRT img.gz 文件直链（必填，建议以 .img.gz 结尾）'
+        description: 'OpenWRT img.gz 文件直链（必填，必须以 .img.gz 结尾）'
         required: true
         type: string
 
@@ -22,44 +22,32 @@ jobs:
 
       - name: Setup Docker
         run: |
-          # 清理已有Docker安装
           sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
           sudo apt-get autoremove -y
-
-          # 安装必要依赖
           sudo apt-get update
           sudo apt-get install -y \
               ca-certificates \
               curl \
               gnupg \
               lsb-release \
-              file  # 添加 file 命令用于检测文件类型
-
-          # 添加Docker官方GPG密钥
+              bsdmainutils  # 提供 hexdump
           sudo mkdir -p /etc/apt/keyrings
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-
-          # 设置仓库
           echo \
             "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
             $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-          # 安装Docker
           sudo apt-get update
           sudo apt-get install -y \
               docker-ce \
               docker-ce-cli \
               containerd.io \
               docker-compose-plugin
-
-          # 启动服务
           sudo systemctl start docker
           sudo systemctl enable docker
-
           docker --version
           echo "✅ Docker安装成功"
 
-      - name: Download OpenWRT image
+      - name: Download and extract OpenWRT image
         id: download
         run: |
           mkdir -p assets output
@@ -68,52 +56,48 @@ jobs:
           IMAGE_URL="${{ github.event.inputs.image_url }}"
           echo "使用提供的链接: $IMAGE_URL"
 
-          # 提取文件名（URL最后一部分）
           FILENAME_GZ=$(basename "$IMAGE_URL")
           DOWNLOAD_PATH="assets/$FILENAME_GZ"
 
-          # 下载文件
           echo "下载文件: $FILENAME_GZ"
-          wget -q "$IMAGE_URL" -O "$DOWNLOAD_PATH" || curl -L -o "$DOWNLOAD_PATH" --retry 3 "$IMAGE_URL"
+          curl -L -o "$DOWNLOAD_PATH" --retry 3 "$IMAGE_URL"
           if [ $? -ne 0 ]; then
               echo "❌ 下载失败"
               exit 1
           fi
 
-          # 检查文件大小（防止下载错误页面）
-          FILE_SIZE=$(stat -c%s "$DOWNLOAD_PATH")
-          echo "下载文件大小: $FILE_SIZE 字节 ($(numfmt --to=iec $FILE_SIZE))"
-          if [ $FILE_SIZE -lt 1048576 ]; then  # 小于1MB可能有问题
-              echo "⚠️ 警告: 文件小于1MB，可能不是有效的镜像文件"
-          fi
+          ACTUAL_SIZE=$(stat -c%s "$DOWNLOAD_PATH")
+          echo "下载文件大小: $ACTUAL_SIZE 字节 ($(numfmt --to=iec $ACTUAL_SIZE))"
 
-          # 检测文件类型
-          FILE_TYPE=$(file -b "$DOWNLOAD_PATH")
-          echo "文件类型: $FILE_TYPE"
+          # 输出文件头部信息（前32字节）
+          echo "文件头部 (前32字节):"
+          hexdump -C "$DOWNLOAD_PATH" | head -2
 
-          # 判断是否为 gzip 压缩
-          if file "$DOWNLOAD_PATH" | grep -q "gzip compressed"; then
-              echo "检测到 gzip 压缩格式，正在解压..."
-              gzip -d "$DOWNLOAD_PATH"
+          # 尝试解压
+          echo "正在解压 $DOWNLOAD_PATH ..."
+          if gzip -d "$DOWNLOAD_PATH"; then
+              # 解压成功，去掉 .gz 后缀得到 .img 文件路径
               IMG_PATH="assets/${FILENAME_GZ%.gz}"
-              echo "解压完成: $IMG_PATH"
+              echo "解压成功: $IMG_PATH"
           else
-              echo "文件不是 gzip 压缩格式，直接作为镜像使用"
-              IMG_PATH="$DOWNLOAD_PATH"
-          fi
-
-          # 检查最终镜像是否存在
-          if [ ! -f "$IMG_PATH" ]; then
-              echo "❌ 错误: 镜像文件 $IMG_PATH 不存在"
+              echo "❌ gzip 解压失败，文件可能不是有效的 gzip 格式或已损坏"
+              echo "请检查上面输出的文件头部信息，确保前两个字节应为 1f 8b (gzip 魔数)"
               exit 1
           fi
 
-          FINAL_SIZE=$(stat -c%s "$IMG_PATH")
-          echo "最终镜像路径: $IMG_PATH"
-          echo "最终镜像大小: $(numfmt --to=iec $FINAL_SIZE)"
+          # 检查解压后的文件是否存在
+          if [ ! -f "$IMG_PATH" ]; then
+              echo "❌ 错误: 解压后的镜像文件 $IMG_PATH 不存在"
+              exit 1
+          fi
+
+          # 转换为绝对路径
+          ABS_IMG_PATH=$(realpath "$IMG_PATH")
+          echo "最终镜像绝对路径: $ABS_IMG_PATH"
+          echo "最终镜像大小: $(stat -c%s "$ABS_IMG_PATH" | numfmt --to=iec)"
 
           # 输出路径供后续步骤使用
-          echo "IMG_PATH=$IMG_PATH" >> $GITHUB_OUTPUT
+          echo "IMG_PATH=$ABS_IMG_PATH" >> $GITHUB_OUTPUT
 
       - name: Generate timestamp for release
         id: timestamp
@@ -124,7 +108,7 @@ jobs:
           echo "RELEASE_NAME=手动构建 $TIMESTAMP" >> $GITHUB_OUTPUT
 
       - name: Build ISO
-        uses: learnscode/openwrt-installer-iso@main
+        uses: learnscode/openwrt-installer-iso@v2
         with:
           INPUT_IMG: "${{ steps.download.outputs.IMG_PATH }}"
           OUTPUT_DIR: "./output"
@@ -143,6 +127,7 @@ jobs:
           tag_name: ${{ steps.timestamp.outputs.RELEASE_TAG }}
           name: ${{ steps.timestamp.outputs.RELEASE_NAME }}
           body: |
+            # immortalwrt 安装器
 
             ## 构建信息
             - 构建时间: ${{ steps.timestamp.outputs.TIMESTAMP }}
