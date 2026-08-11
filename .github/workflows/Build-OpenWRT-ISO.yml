@@ -121,7 +121,7 @@ jobs:
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-installer
+          name: OpenWrt-installer
           path: output/*.iso
           retention-days: 30
 
@@ -131,7 +131,7 @@ jobs:
           tag_name: ${{ steps.timestamp.outputs.RELEASE_TAG }}
           name: ${{ steps.timestamp.outputs.RELEASE_NAME }}
           body: |
-            # immortalwrt 安装器
+            # OpenWrt ISO安装镜像
 
             ## 构建信息
             - 构建时间: ${{ steps.timestamp.outputs.TIMESTAMP }}
