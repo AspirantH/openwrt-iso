@@ -1,0 +1,181 @@
+name: AutoBuild-OpenWRT-ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      alpine_version:
+        description: 'Alpine 版本'
+        required: false
+        default: '3.20'
+      auto_detect:
+        description: '自动获取'
+        required: false
+        default: 'false'
+        type: boolean
+      image_url:
+        description: 'OpenWRT img.gz 文件直链（以 .img.gz 结尾）'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Docker
+        run: |
+          sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+          sudo apt-get autoremove -y
+          sudo apt-get update
+          sudo apt-get install -y \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release \
+              bsdmainutils \
+              jq
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
+              docker-ce \
+              docker-ce-cli \
+              containerd.io \
+              docker-compose-plugin
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker --version
+          echo "✅ Docker安装成功"
+
+      - name: Determine image URL
+        id: determine
+        run: |
+          if [ "${{ github.event.inputs.auto_detect }}" == "true" ]; then
+            echo "🔍 自动检测最新固件..."
+            API_URL="https://api.github.com/repos/AspirantH/openwrt/releases/latest"
+            ASSETS=$(curl -sL "$API_URL" | jq -r '.assets[].browser_download_url')
+            URL=$(echo "$ASSETS" | grep -E '[0-9]{8}-openwrt-x86-64-generic-squashfs-combined-efi\.img\.gz$' | head -n1)
+            if [ -z "$URL" ]; then
+              echo "❌ 未找到匹配的固件文件"
+              exit 1
+            fi
+            echo "✅ 找到固件 URL: $URL"
+            echo "IMAGE_URL=$URL" >> $GITHUB_ENV
+            echo "SOURCE_DESC=自动检测自 AspirantH/openwrt 最新 Release" >> $GITHUB_ENV
+          else
+            if [ -z "${{ github.event.inputs.image_url }}" ]; then
+              echo "❌ 未提供 image_url 且未启用自动检测"
+              exit 1
+            fi
+            echo "IMAGE_URL=${{ github.event.inputs.image_url }}" >> $GITHUB_ENV
+            echo "SOURCE_DESC=手动输入: ${{ github.event.inputs.image_url }}" >> $GITHUB_ENV
+          fi
+
+      - name: Download and extract OpenWRT image
+        id: download
+        run: |
+          mkdir -p assets output
+          chmod 777 output
+
+          IMAGE_URL="${{ env.IMAGE_URL }}"
+          echo "使用链接: $IMAGE_URL"
+
+          FILENAME_GZ=$(basename "$IMAGE_URL")
+          DOWNLOAD_PATH="assets/$FILENAME_GZ"
+
+          echo "下载文件: $FILENAME_GZ"
+          curl -L -o "$DOWNLOAD_PATH" --retry 3 "$IMAGE_URL"
+          if [ $? -ne 0 ]; then
+              echo "❌ 下载失败"
+              exit 1
+          fi
+
+          ACTUAL_SIZE=$(stat -c%s "$DOWNLOAD_PATH")
+          echo "下载文件大小: $ACTUAL_SIZE 字节 ($(numfmt --to=iec $ACTUAL_SIZE))"
+
+          echo "文件头部 (前32字节):"
+          hexdump -C "$DOWNLOAD_PATH" | head -2 || echo "hexdump failed"
+
+          echo "正在解压 $DOWNLOAD_PATH ..."
+          gzip -d "$DOWNLOAD_PATH" 2>&1 || true
+
+          IMG_PATH="assets/${FILENAME_GZ%.gz}"
+
+          if [ -f "$IMG_PATH" ] && [ -s "$IMG_PATH" ]; then
+              echo "解压成功: $IMG_PATH"
+          else
+              echo "❌ 标准解压失败，尝试使用 gunzip -c 手动解压..."
+              gunzip -c "$DOWNLOAD_PATH" > "${IMG_PATH}.tmp" 2>/dev/null
+              if [ $? -eq 0 ] && [ -s "${IMG_PATH}.tmp" ]; then
+                  mv "${IMG_PATH}.tmp" "$IMG_PATH"
+                  echo "手动解压成功: $IMG_PATH"
+              else
+                  echo "❌ 所有解压尝试均失败"
+                  exit 1
+              fi
+          fi
+
+          ABS_IMG_PATH=$(realpath "$IMG_PATH")
+          echo "最终镜像绝对路径: $ABS_IMG_PATH"
+          echo "最终镜像大小: $(stat -c%s "$ABS_IMG_PATH" | numfmt --to=iec)"
+
+          echo "IMG_PATH=$ABS_IMG_PATH" >> $GITHUB_OUTPUT
+
+          # --- 新增：提取日期前缀并生成 ISO 文件名 ---
+          DATE_PREFIX=$(echo "$FILENAME_GZ" | grep -oE '^[0-9]{8}')
+          if [ -z "$DATE_PREFIX" ]; then
+              # 若无法从文件名提取（如手动输入非标准链接），则使用当前日期
+              DATE_PREFIX=$(date +%Y%m%d)
+              echo "⚠️ 无法从文件名提取日期，使用当前日期: $DATE_PREFIX"
+          fi
+          ISO_NAME="${DATE_PREFIX}-openwrt-x86-64-generic-squashfs-combined-efi.iso"
+          echo "ISO_NAME=$ISO_NAME" >> $GITHUB_ENV
+          echo "ISO_DATE=$DATE_PREFIX" >> $GITHUB_ENV
+
+      - name: Generate timestamp for release
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date -u +'%Y%m%d-%H%M%S')
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "RELEASE_TAG=manual-$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=手动构建 $TIMESTAMP" >> $GITHUB_OUTPUT
+
+      - name: Build ISO
+        uses: learnscode/openwrt-installer-iso@v2
+        with:
+          INPUT_IMG: "${{ steps.download.outputs.IMG_PATH }}"
+          OUTPUT_DIR: "./output"
+          OUTPUT_ISO_NAME: "${{ env.ISO_NAME }}"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt-installer
+          path: output/*.iso
+          retention-days: 3
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.timestamp.outputs.RELEASE_TAG }}
+          name: ${{ steps.timestamp.outputs.RELEASE_NAME }}
+          body: |
+            # OpenWrt ISO安装镜像
+
+            ## 构建信息
+            - 构建时间: ${{ steps.timestamp.outputs.TIMESTAMP }}
+            - Alpine 版本: ${{ github.event.inputs.alpine_version }}
+            - 镜像来源: ${{ env.SOURCE_DESC }}
+            - 固件日期: ${{ env.ISO_DATE }}
+            - 生成的 ISO 文件名: ${{ env.ISO_NAME }}
+            - 提交: ${{ github.sha }}
+          files: output/*.iso
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
