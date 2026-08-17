@@ -10,7 +10,7 @@ on:
       auto_detect:
         description: '自动获取'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
       image_url:
         description: 'OpenWRT img.gz 文件直链（以 .img.gz 结尾）'
