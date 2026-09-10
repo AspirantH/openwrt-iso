@@ -147,7 +147,7 @@ jobs:
           echo "RELEASE_NAME=手动构建 $TIMESTAMP" >> $GITHUB_OUTPUT
 
       - name: Build ISO
-        uses: AspirantH/openwrt-installer-iso@v2
+        uses: AspirantH/openwrt-iso@v2
         with:
           INPUT_IMG: "${{ steps.download.outputs.IMG_PATH }}"
           OUTPUT_DIR: "./output"
